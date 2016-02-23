@@ -1,0 +1,284 @@
+---
+title: "Modeling public supply water use in Missouri from 1901-2010"
+author: "Scott Worland"
+date: "February 22, 2016"
+output: 
+  pdf_document: 
+    fig_caption: yes
+    latex_engine: lualatex
+    toc: yes
+---
+
+# Methods
+
+## Data pre-processing
+```{r,eval=T,echo=F,warning=F,message=F}
+library(ggplot2); library(GGally); library(reshape2); 
+library(hydroGOF); library(lme4); library(rpart);
+library(kknn); library(randomForest); library(gbm);
+library(caret); library(doParallel); library(gridExtra);
+library(earth); library(RColorBrewer); library(ggmap);
+library(grid)
+
+setwd("C:/Users/scworlan/Documents/MAP/OzarkWaterUse/Ozark-water-use")
+```
+
+Begin by reading in the raw data and completing some basic pre-processing steps,
+
+```{r,eval=T,echo=T,warning=F,message=F}
+# Load raw data (from B. Clarke 12/23/2015)
+raw.data <- read.csv("WU_exportPopPrecipSSWU.csv", na.strings="-9999")
+
+# Raw data processing
+MO.raw <- subset(raw.data,State=="MO") # subset MO
+MO.raw <- subset(MO.raw, yr %in% 1901:2010) # remove 2011-2015 bc no mgd values
+MO.raw <- MO.raw[-which(MO.raw$divs==""),] # remove rows with no division
+MO.raw <- MO.raw[-which(MO.raw$pop==0),] # remove wells with zero pop
+MO.raw$mgd[MO.raw$mgd==0] <- NA # remove mgd=0 values because they are an artifact
+MO.ps <- subset(MO.raw, divs == "Public Supply") # subset public supply
+MO.ps$mgd[MO.ps$yr==1901] <- min(MO.ps$mgd,na.rm=T)
+```
+
+Before we start building the models, let's look at how the predictors are related to MGD. The log transformation of population and MGD are shown in figure 1. The justification for this is further addressed below.
+
+```{r fig1,eval=T,echo=F, fig.align='center', cache=T, warning=F,message=F, fig.cap="Pairs plot of predictors and log10(mgd)"}
+pairs.data <- MO.ps[complete.cases(MO.ps),c(9,6,8,14,15)]
+pairs.data$log.mgd <- log10(pairs.data$mgd)
+pairs.data$log.pop <- log10(pairs.data$pop)
+pairs.data.plot <- pairs.data[,c(6,3,4,7)]
+
+ggpairs(pairs.data.plot, upper=list(continuous = wrap("points", alpha = 0.2, size=0.1), discrete = "blank", na = "blank"), 
+        diag=list(continuous = "barDiag", discrete = "blankDiag", na = "blankDiag"), 
+        lower=list(continuous = wrap("density", size=0.2), discrete="blank", na="blank"),
+        columnLabels = colnames(pairs.data.plot)) + theme_bw(base_size=8)
+```
+
+Population and depth are both correlated with MGD, and are also somewhat correlated with eachother (Figure 1). Because depth has zero for almost 25% of its values, and provides similar information to population, we can not use depth as a predictor. Precipitation is not correlated with MGD and will not add explanatory power to linear models, and can also be dropped from the analysis^[Various non-linear models were built that included precipitation, well depth, and geographic coordinates. The RMSE from the cross-validated predictions were over 100% greater than when they were excluded].
+
+The response variable (mgd) must be greater than zero, and we will place this constraint on the models by taking the log transformation of mgd. When we exponentiate the predictions post-modeling we are gauranteed a postive value (for any real $a$, $10^a > 0$).
+
+```{r,eval=T,echo=T,warning=F,message=F}
+mod.dat <- MO.ps[complete.cases(MO.ps),c(9,3,6,8,10,11,14,15)] #remove NA and subset
+mod.dat$log.mgd <- log10(mod.dat$mgd) # take log10 transformation
+mod.dat$log.pop <- log10(mod.dat$pop)
+```
+
+```{r fig2,eval=T,echo=F, fig.align='center',warning=F,message=F, fig.cap="Histograms of (top) untransformed and (bottom) transformed response variable"}
+hist1 <- ggplot(mod.dat) + geom_histogram(aes(mgd),bins=70, color="white") + theme_bw(base_size=12) + xlim(0,0.5)
+hist2 <- ggplot(mod.dat) + geom_histogram(aes(log.mgd),bins=70, color="white") + theme_bw(base_size=12) + xlim(-3,1)
+
+grid.arrange(hist1, hist2, ncol=1)
+```
+
+We can visualize the transformation by plotting histograms of the transformed and untransformed values in Figure 2. The data need to be scaled to meaningfully compare the coefficients for the different predictors. To do this I will just calculate the z score for each explanatory variable,
+
+$$
+Z = \frac{x^i_j - \mu_j}{\sigma_j}
+$$
+
+Where $i$ is the row index and $j$ is the column index. I will do this by using the `scale` function in R,
+
+```{r,eval=T,echo=T,warning=F,message=F}
+mod.dat[,c(4:8,10)] <- scale(mod.dat[,c(4:8,10)]) # scale the predictors
+```
+
+# Models
+
+## Linear Regression
+
+```{r,eval=T,echo=T}
+## Linear model
+lm <- lm(log.mgd ~ poly(log.pop,2), data = mod.dat, weights=abs(1950-yr))
+```
+
+## KNN Regression
+```{r,eval=T,echo=T, cache=T}
+## K-nearest neighbors
+knn.train <- train.kknn(log.mgd ~ log.pop, weights=abs(1950-yr), 
+                        data = mod.dat,  kmax = 100, 
+                        kernel = c("rectangular", "triangular", 
+                                   "biweight", "gaussian", 
+                                   "triweight", "inv"));
+```
+
+## Single Regression Tree
+```{r,eval=T,echo=T, cache=T}
+## regression tree
+set.seed(5)
+tree <- rpart(log.mgd ~ log.pop, data = mod.dat, weights=abs(1960-yr), 
+              control=rpart.control(minsplit=100, cp=0))
+```
+
+## MARS
+```{r,eval=T,echo=T, cache=T}
+mars <- earth(log.mgd ~ log.pop, data = mod.dat,weights=abs(1960-yr))
+```
+
+## LOESS
+```{r,eval=T,echo=T, cache=T}
+poly <- loess(log.mgd ~ log.pop, data = mod.dat)
+```
+
+## Gradient Boosting
+```{r,eval=F,echo=T,cache=T,warning=F,message=F}
+# Train using cross validation
+fitControl <- trainControl(method = "cv", number = 10)
+
+# Create grid of training parameters
+gbmGrid <-  expand.grid(.interaction.depth = seq(20,45,by=5),
+                        .n.trees = c(1000,5000,7000),
+                        .shrinkage = c(0.1),
+                        .n.minobsinnode=100)
+
+# Registers available cores on machine
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+ptm <- proc.time() # Start the clock
+# Train model
+set.seed(100)
+gbm1 <- caret::train(log.mgd ~ log.pop, data = mod.dat,
+                        method = "gbm",
+                        verbose = FALSE,
+                        tuneGrid = gbmGrid)
+
+stopCluster(cl)
+
+proc.time() - ptm # Stop the clock
+```
+
+```{r fig3,eval=F,echo=T,cache=T,warning=F,message=F, fig.align='center',fig.cap="Optimal parameters from training GBM model."}
+#Plot training parameters
+ggplot(gbm1) + theme_bw(base_size=12)
+```
+
+
+```{r,eval=T,echo=T, cache=T,warning=F,message=F}
+## predict 1901-2010 using different models
+MO.features <- MO.ps[,c(9,6,15)]
+MO.features$log.pop <- as.numeric(scale(log10(MO.features$pop)))
+
+MO.predict <- data.frame(cbind(MO.ps$yr,
+                               MO.ps$mgd,
+                               MO.ps$lat,
+                               MO.ps$long,
+                               10^predict(lm, MO.features),
+                               10^predict(knn.train, MO.features),
+                               10^predict(tree, MO.features),
+                               10^predict(mars, MO.features),
+                               10^predict(poly, MO.features),
+                               10^predict(gbm1, MO.features)))
+
+colnames(MO.predict) <- c("yr","actual","lat","long","lm","knn","reg_tree","mars","loess","gbm")
+
+## Annual sums for plot
+MO.annual.predict <- aggregate(.~yr, data = MO.predict, sum, na.action = na.pass, na.rm=TRUE)
+MO.annual.predict$actual[MO.annual.predict$actual  == 0] <- NA
+MO.annual.predict$actual[MO.annual.predict$yr == 1901] <- 0
+```
+
+```{r fig4,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Annual sums of predicted MGD values from 173,670 individual well observations."}
+## plot predictions
+dmelt <- melt(MO.annual.predict,id="yr")
+
+ggplot() + geom_line(data=subset(dmelt,variable != "actual"),aes(yr,value,color=variable),size=1)  +
+  geom_point(data=subset(dmelt,variable == "actual"), aes(yr,value,fill=variable), shape=23, size = 3, alpha=0.9) + 
+  ylab("mgd") + theme_bw(base_size=14) + xlab("year") +  labs(color="Models") + scale_color_brewer(palette="Dark2") +
+  labs(fill=NULL) + ggtitle("Model predictions")
+```
+
+
+## Constrain 1901 predictions to zero
+```{r,eval=T,echo=F, warning=F,message=F}
+# create sequence from 0 to 1 for 1901 to 2010
+cons <- data.frame(cbind(1901:2010, seq(0,1,length.out=110)))
+colnames(cons) = c("yr","mult")
+MO.pred.cons <- merge(MO.predict,cons,by="yr")
+
+# constrain predictions to be zero in 1901
+MO.pred.cons[,5:10] <- MO.pred.cons[,5:10]*MO.pred.cons$mult
+MO.pred.cons <- MO.pred.cons[,-11]
+
+## Annual sums for plot
+MO.annual.predict.cons <- aggregate(.~yr, data = MO.pred.cons, sum, na.action = na.pass, na.rm=TRUE)
+MO.annual.predict.cons$actual[MO.annual.predict.cons$actual  == 0] <- NA
+MO.annual.predict.cons$actual[MO.annual.predict.cons$yr == 1901] <- 0
+```
+
+```{r fig5,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Annual sums of model MGD predictions constrained at zero for 1901 from 173,670 individual well observations."}
+## plot predictions
+dmelt.cons <- melt(MO.annual.predict.cons,id="yr")
+
+ggplot() + geom_line(data=subset(dmelt.cons,variable != "actual"),aes(yr,value,color=variable),size=1)  +
+  geom_point(data=subset(dmelt.cons,variable == "actual"), aes(yr,value,fill=variable), shape=23, size = 3, alpha=0.9) + 
+  ylab("mgd") + theme_bw(base_size=14) + xlab("year") +  labs(color="Models") + scale_color_brewer(palette="Dark2") +
+  labs(fill=NULL) + ggtitle("Zero-constrained models")
+```
+
+## Maps
+```{r,eval=T,echo=F,warning=F,message=F,fig.align='center',cache=T}
+Mo.years <- subset(MO.pred.cons, yr %in% c(1905, 1930, 1970, 2010))
+
+# custom theme for making clean maps
+theme_blank <- function(){
+  theme(panel.background = element_rect(fill = "transparent",color=NA),
+        plot.background = element_rect(fill = "transparent",color=NA),
+        legend.background = element_rect(fill = "transparent",color=NA),
+        text = element_text(size=16),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin=unit(c(0,0,-1,-1),"lines"))
+}
+  
+state = map_data('state')
+state2 = subset(state, region == "missouri")
+
+m1 <- ggplot() + coord_fixed(1.3) 
+m1 <- m1 + geom_polygon(data=state2,aes(long,lat, group=group), 
+                       color = "black", fill= "grey90",size=1) 
+m1 <- m1 + geom_point(data=Mo.years, aes(long,lat,size=gbm), shape=21, fill ="dodgerblue", color = "black", alpha=0.6)
+m1 <- m1 + facet_wrap(~yr) + theme_blank() + labs(size="MGD")
+m1
+```
+
+# Appendix
+
+## Include precipitation and depth
+```{r fig6, ,eval=T,echo=T, warning=F,message=F,fig.align='center', fig.cap="Regression trees built with population (tree1) and with populations, depth, and precipitation (tree3)."}
+set.seed(5)
+tree2 <- rpart(log.mgd ~ log.pop + precip + depth, data = mod.dat, weights=abs(1960-yr), 
+              control=rpart.control(minsplit=100, cp=0))
+
+# subset features
+MO.features2 <- MO.ps[,c(9,6,8,14,15)]
+MO.features2$log.pop <- log10(MO.features2$pop)
+MO.features2[,3:6] <- scale(MO.features2[,3:6])
+
+MO.predict2 <- data.frame(cbind(MO.ps$yr,
+                               MO.ps$mgd,
+                               10^predict(tree, MO.features2),
+                               10^predict(tree2, MO.features2)))
+
+colnames(MO.predict2) <- c("yr","actual","tree1","tree3")
+
+## Annual sums for plot
+MO.annual.predict2 <- aggregate(.~yr, data = MO.predict2, sum, na.action = na.pass, na.rm=TRUE)
+MO.annual.predict2$actual[MO.annual.predict2$actual  == 0] <- NA
+MO.annual.predict2$actual[MO.annual.predict2$yr == 1901] <- 0
+
+dmelt2 <- melt(MO.annual.predict2,id="yr")
+
+ggplot() + geom_line(data=subset(dmelt2,variable != "actual"),aes(yr,value,color=variable),size=1)  +
+  geom_point(data=subset(dmelt2,variable == "actual"), aes(yr,value,fill=variable), shape=23, size = 3, alpha=0.9) + 
+  ylab("mgd") + theme_bw(base_size=14) + xlab("year") +  labs(color="Models") + 
+  scale_colour_manual(values = c("black","grey60")) + labs(fill=NULL) +
+  ggtitle("Regression trees with single predictor and three predictors")
+
+```
+
+
+
+
