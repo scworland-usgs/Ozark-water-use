@@ -7,25 +7,29 @@ output:
     fig_caption: yes
     latex_engine: lualatex
     toc: yes
+    toc_depth: 4
+    includes:  
+      in_header: preamble-latex.tex
 ---
 
 # Methods
 
 ## Data pre-processing
-```{r,eval=T,echo=F,warning=F,message=F}
+```{r libs,eval=T,echo=F,warning=F,message=F}
 library(ggplot2); library(GGally); library(reshape2); 
 library(hydroGOF); library(lme4); library(rpart);
 library(kknn); library(randomForest); library(gbm);
 library(caret); library(doParallel); library(gridExtra);
 library(earth); library(RColorBrewer); library(ggmap);
-library(grid)
+library(grid); library(rgdal); library(rgeos);
+library(maptools)
 
 setwd("C:/Users/scworlan/Documents/MAP/OzarkWaterUse/Ozark-water-use")
 ```
 
 Begin by reading in the raw data and completing some basic pre-processing steps,
 
-```{r,eval=T,echo=T,warning=F,message=F}
+```{r data,eval=T,echo=T,warning=F,message=F}
 # Load raw data (from B. Clarke 12/23/2015)
 raw.data <- read.csv("WU_exportPopPrecipSSWU.csv", na.strings="-9999")
 
@@ -36,12 +40,11 @@ MO.raw <- MO.raw[-which(MO.raw$divs==""),] # remove rows with no division
 MO.raw <- MO.raw[-which(MO.raw$pop==0),] # remove wells with zero pop
 MO.raw$mgd[MO.raw$mgd==0] <- NA # remove mgd=0 values because they are an artifact
 MO.ps <- subset(MO.raw, divs == "Public Supply") # subset public supply
-MO.ps$mgd[MO.ps$yr==1901] <- min(MO.ps$mgd,na.rm=T)
 ```
 
 Before we start building the models, let's look at how the predictors are related to MGD. The log transformation of population and MGD are shown in figure 1. The justification for this is further addressed below.
 
-```{r fig1,eval=T,echo=F, fig.align='center', cache=T, warning=F,message=F, fig.cap="Pairs plot of predictors and log10(mgd)"}
+```{r fig1_pairs,eval=T,echo=F, fig.align='center', cache=T, warning=F,message=F, fig.height=5, fig.width=6, fig.cap="Pairs plot of predictors and log10(mgd)"}
 pairs.data <- MO.ps[complete.cases(MO.ps),c(9,6,8,14,15)]
 pairs.data$log.mgd <- log10(pairs.data$mgd)
 pairs.data$log.pop <- log10(pairs.data$pop)
@@ -53,11 +56,12 @@ ggpairs(pairs.data.plot, upper=list(continuous = wrap("points", alpha = 0.2, siz
         columnLabels = colnames(pairs.data.plot)) + theme_bw(base_size=8)
 ```
 
-Population and depth are both correlated with MGD, and are also somewhat correlated with eachother (Figure 1). Because depth has zero for almost 25% of its values, and provides similar information to population, we can not use depth as a predictor. Precipitation is not correlated with MGD and will not add explanatory power to linear models, and can also be dropped from the analysis^[Various non-linear models were built that included precipitation, well depth, and geographic coordinates. The RMSE from the cross-validated predictions were over 100% greater than when they were excluded].
+Population and depth are both correlated with MGD, and are also somewhat correlated with eachother (Figure 1). Because depth has zero for almost 25% of its values, and provides similar information to population, we can not use depth as a predictor. Precipitation is not correlated with MGD and will not add explanatory power to linear models, and can also be dropped from the analysis^[Various non-linear models were built that included precipitation, well depth, and geographic coordinates. The RMSE from the cross-validated predictions were over 100% greater than when they were excluded. Figure 8 in Appendix A is an example.].
 
 The response variable (mgd) must be greater than zero, and we will place this constraint on the models by taking the log transformation of mgd. When we exponentiate the predictions post-modeling we are gauranteed a postive value (for any real $a$, $10^a > 0$).
 
-```{r,eval=T,echo=T,warning=F,message=F}
+```{r mod_data,eval=T,echo=T,warning=F,message=F}
+MO.ps$mgd[MO.ps$yr==1901] <- min(MO.ps$mgd,na.rm=T)
 mod.dat <- MO.ps[complete.cases(MO.ps),c(9,3,6,8,10,11,14,15)] #remove NA and subset
 mod.dat$log.mgd <- log10(mod.dat$mgd) # take log10 transformation
 mod.dat$log.pop <- log10(mod.dat$pop)
@@ -78,63 +82,88 @@ $$
 
 Where $i$ is the row index and $j$ is the column index. I will do this by using the `scale` function in R,
 
-```{r,eval=T,echo=T,warning=F,message=F}
+```{r scale,eval=T,echo=T,warning=F,message=F}
 mod.dat[,c(4:8,10)] <- scale(mod.dat[,c(4:8,10)]) # scale the predictors
 ```
 
-# Models
+## Models
 
-## Linear Regression
+### Linear Regression
 
-```{r,eval=T,echo=T}
-## Linear model
-lm <- lm(log.mgd ~ poly(log.pop,2), data = mod.dat, weights=abs(1950-yr))
+A weighted least squares linear regression model was built to predict mgd using population. Both an intercept parameter ($\theta_0$) and a slope parameter ($\theta_1$) were estimated. The observations were weighted by years, where heavier weights were placed on observations that fall within the earlier and later years. This was done to emphasize closer fits at the begining and end of the time series. A similar apprach was taken for several of the other models below. 
+
+```{r lm,eval=T,echo=T}
+# Linear model
+lm <- lm(log.mgd ~ log.pop, data = mod.dat, weights=abs(1950-yr))
 ```
 
-## KNN Regression
-```{r,eval=T,echo=T, cache=T}
-## K-nearest neighbors
-knn.train <- train.kknn(log.mgd ~ log.pop, weights=abs(1950-yr), 
-                        data = mod.dat,  kmax = 100, 
-                        kernel = c("rectangular", "triangular", 
-                                   "biweight", "gaussian", 
-                                   "triweight", "inv"));
+
+### K-Nearest Neighbors Regression
+
+A KNN regression model was built to predict mgd using population. The KNN model predicts a new value of the response variable using the K-closest samples from the data that was used to train the model^[where "closest" here is defined by a generalization of Euclidean distances, although there are other alternatives that can produce comparable results]. For example, to predict a new mgd value KNN regression finds the K-nearest neighbors (K is a tuning parameter chosen through cross validation) in the predictor space, just population for this example, and assigns mean mgd value associated with those population values as the prediction. Basic KNN regression does not account for the relative distances *between* the K closeset neighbors and the new point. There are no weights placed on the mgd values used to make the prediction. If we want to reduce the bias, we would like for closer neighbors to receive higher weights, and if we want to reduce the variance, we might want the opposite. One way to accomplish this is to use a kernel (weighting function) on the euclidean distances. We can train the model using different K neighbors and kernels and choose the optimal parameters using cross validation,
+
+```{r knn,eval=T,echo=T, cache=T}
+# K-nearest neighbors
+knn.train <- train.kknn(log.mgd ~ log.pop, data = mod.dat,  kmax = 100, 
+                        kernel = c("rectangular", "triangular", "inv", 
+                                   "gaussian", "triweight"));
 ```
 
-## Single Regression Tree
-```{r,eval=T,echo=T, cache=T}
-## regression tree
+A plot of the training parameters can be found in Figure 8 in Appendix A. 
+
+### Single Regression Tree
+
+A regression tree was built to predict mgd using population. Regression trees partitions the predictor space through a set of recursive binary splits and predicts the target variable based on the mean values of the features contained within the partitions. The splits are chosen based on a reduction in error associated with the split. The individual splits are chosen based on a greedy algorithm, meaning that it optimizes the local split and does not attempt a global optimum which would be computationally expensive. Unlike simple least-squared methods, decision trees can learn very irregular patterns and produce models with very low bias but high variance.
+
+```{r tree,eval=T,echo=T, cache=T}
+# regression tree
 set.seed(5)
-tree <- rpart(log.mgd ~ log.pop, data = mod.dat, weights=abs(1960-yr), 
+tree <- rpart(log.mgd ~ log.pop, data = mod.dat, 
               control=rpart.control(minsplit=100, cp=0))
 ```
 
-## MARS
-```{r,eval=T,echo=T, cache=T}
+### Multivaraite Adaptive Regression Spline
+
+A multivariate adaptive regression spline (MARS) model was built to predict mgd using population. Mars models are similar to piecewise linear models in that the predictor is divided into groups and separate linear models are built for each group. The first cut point is chosen by considering each data point for the predictor, building linear regression models on each side of the cut point, and calculating the prediction error. The cut point which provides the lowest prediction error is chosen. The processes is repeated until the reduction in error is below some threshold. The model is built in R using the following script.
+
+```{r mars,eval=T,echo=T, cache=T}
+# MARS model
 mars <- earth(log.mgd ~ log.pop, data = mod.dat,weights=abs(1960-yr))
 ```
 
-## LOESS
-```{r,eval=T,echo=T, cache=T}
-poly <- loess(log.mgd ~ log.pop, data = mod.dat)
+The resulting model selected 7 cut points on population with varying $\theta_1$ parameters and a single $\theta_0$ parameter. 
+
+### Local Polynomial Regression 
+
+A local polynomial regression (LOESS) model was built to predict mgd using population. LOESS models use a combination of techniques that blends MARS and KNN regression models. A local model is built for each observation and set of the neighboring observations. The number of neighbors is chosen by providing a value $\alpha$, or the "span", which is just a fraction of the total observations. For LOESS, a polynomial regression model is fit to only the neighbors within $\alpha$ of the the current observation. A separate model is build for each observation and it's neighbors, and the fitted value for that observation is recorded. After all the models are built, the fitted values are connected, producing the local polynomial nonparametric regression curve.
+
+```{r loess,eval=T,echo=T, cache=T}
+# LOESS model
+poly <- loess(log.mgd ~ log.pop, data = mod.dat, span = 100/nrow(mod.dat))
 ```
 
-## Gradient Boosting
-```{r,eval=F,echo=T,cache=T,warning=F,message=F}
-# Train using cross validation
+### Gradient Boosting Machine
+
+A gradient boosting machine (gbm) was used to generate predictions of mgd based on population. GBMs are one of the most powerful ensemble methods in machine learning. Gradient boosting is an algortithm to ensemble the predictions of an additive model consisting of weak base learners and models built on the residuals of the base learner and subsequent residual models. The name "gradient boosting" comes from the the relationship to gradient descent algorithms used to optimize many statistical models (the residuals of a model is the gradient). 
+
+A regression tree was used as the weak base learner below. The algorithm proceeds as follows: (1) select tree depth and number of iterations^[in practice this is optimized by cross validation and can be visualized in Figure 9 of Appendix A] (2) build a single regression tree on the data, (3) calculate the residuals from the first model, (4) fit a new regression tree *using the residuals from the first model* as the response variable, (5) add the predictions from number 4 to number 3, (6) repeat. This profoundly simple algorithm works because the magnitude of the residuals of the basse learner can be thought of as a measure of how well the model fit the data. Large residuals are where the model did poorly, and small residuals are where the model fit well. When a model is built *on* the residuals, then it is effectively *boosting* the predictions where the first model did poorly. If the base learner under-predicted an observation (postive residual), then a model on the residuals will often predict a positive value (0 < $\hat{y_2}$ < ($y_1 - \hat{y_1}$), which will be added to the original prediction, hence moving it upwards closer to the actual value. If the residual model happens to predicts a postive value greater than the residual from the first model ($\hat{y_2}$ > ($y_1 - \hat{y_1}$)^[this is more common for small residuals, and it makes little difference in the final outcome], meaning the prediction is now over-estimated, then the next iteration should predict a negative value and move the prediction downwards closer to the actual. The model needs to be trained over its tuning paramers. The implentation for this in R is seen below (takes ~1.5 hrs to run when parallelized over two cores),
+
+```{r gbm,eval=F,echo=T,cache=T,warning=F,message=F}
+# 10-fold cross validation
 fitControl <- trainControl(method = "cv", number = 10)
 
 # Create grid of training parameters
-gbmGrid <-  expand.grid(.interaction.depth = seq(20,45,by=5),
-                        .n.trees = c(1000,5000,7000),
+gbmGrid <-  expand.grid(.interaction.depth = seq(20,65,by=5),
+                        .n.trees = c(3000,5000,7000),
                         .shrinkage = c(0.1),
                         .n.minobsinnode=100)
 
-# Registers available cores on machine
+# Registers available cores
 cl <- makeCluster(detectCores())
 registerDoParallel(cl)
 
 ptm <- proc.time() # Start the clock
+
 # Train model
 set.seed(100)
 gbm1 <- caret::train(log.mgd ~ log.pop, data = mod.dat,
@@ -147,17 +176,25 @@ stopCluster(cl)
 proc.time() - ptm # Stop the clock
 ```
 
-```{r fig3,eval=F,echo=T,cache=T,warning=F,message=F, fig.align='center',fig.cap="Optimal parameters from training GBM model."}
-#Plot training parameters
-ggplot(gbm1) + theme_bw(base_size=12)
+```{r predict,eval=T,echo=F, cache=T,warning=F,message=F}
+load("MO_predict.rda")
+load("gbm_MO_wateruse.rda")
+
+## Annual sums for plot
+MO.annual.predict <- aggregate(.~yr, data = MO.predict[,-(3:4)], sum, 
+                               na.action = na.pass, na.rm=TRUE)
+MO.annual.predict$actual[MO.annual.predict$actual  == 0] <- NA
+MO.annual.predict$actual[MO.annual.predict$yr == 1901] <- 0
 ```
 
+Now that we have built several models, we need to aggregate the predictions on the entire dataset (1901-2010) and see how they compare to the actual values. Because we are predicting the log-transformed mgd value, we need to take the anti-log of the predictions to make comparisons.
 
-```{r,eval=T,echo=T, cache=T,warning=F,message=F}
-## predict 1901-2010 using different models
+```{r predict_full,eval=F,echo=T, cache=T,warning=F,message=F}
+## Select population and year for 1901-2010
 MO.features <- MO.ps[,c(9,6,15)]
 MO.features$log.pop <- as.numeric(scale(log10(MO.features$pop)))
 
+## aggregate the predictions from the different models
 MO.predict <- data.frame(cbind(MO.ps$yr,
                                MO.ps$mgd,
                                MO.ps$lat,
@@ -169,27 +206,31 @@ MO.predict <- data.frame(cbind(MO.ps$yr,
                                10^predict(poly, MO.features),
                                10^predict(gbm1, MO.features)))
 
-colnames(MO.predict) <- c("yr","actual","lat","long","lm","knn","reg_tree","mars","loess","gbm")
+## replace with simple column names
+colnames(MO.predict) <- c("yr","actual","lat","long","lm","knn",
+                          "reg_tree","mars","loess","gbm")
 
-## Annual sums for plot
-MO.annual.predict <- aggregate(.~yr, data = MO.predict, sum, na.action = na.pass, na.rm=TRUE)
+## aggregate annuals sums from the indivudual wells
+MO.annual.predict <- aggregate(.~yr, data = MO.predict[,-(3:4)], sum, 
+                               na.action = na.pass, na.rm=TRUE)
 MO.annual.predict$actual[MO.annual.predict$actual  == 0] <- NA
 MO.annual.predict$actual[MO.annual.predict$yr == 1901] <- 0
 ```
 
-```{r fig4,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Annual sums of predicted MGD values from 173,670 individual well observations."}
+```{r fig4, eval=T, echo=F, fig.align='center', fig.cap="Annual sums of predicted MGD values from ~1600 individual wells", fig.height=5, fig.width=6, message=F, warning=F}
 ## plot predictions
 dmelt <- melt(MO.annual.predict,id="yr")
 
 ggplot() + geom_line(data=subset(dmelt,variable != "actual"),aes(yr,value,color=variable),size=1)  +
   geom_point(data=subset(dmelt,variable == "actual"), aes(yr,value,fill=variable), shape=23, size = 3, alpha=0.9) + 
-  ylab("mgd") + theme_bw(base_size=14) + xlab("year") +  labs(color="Models") + scale_color_brewer(palette="Dark2") +
+  ylab("mgd") + theme_bw(base_size=12) + xlab("year") +  labs(color="Models") + scale_color_brewer(palette="Dark2") +
   labs(fill=NULL) + ggtitle("Model predictions")
 ```
 
+### Constrain 1901 predictions to zero
+All of the models did poorly for the early years. This is not due to the models "failing" but due to the large amount of bias introduced to the models because most of the observations with actual values are for the years 1970-201 (the actual value of zero was added as a constraint and is not actually and actual). The models fit the data well where there were a large number of observations. We can add a simple multiplier *post prediction* to force the models to predict  zero mgd value for 1901. Basically, we create a numeric vector ranging from zero to one that is the same length as the total number of years. We then multiply the predictions by the fraction in this vector. For example, predictions for 1901 are multiplied by 0, predictions for ~1955 are multiplied by 0.5, and predictions for 2010 are multiplied by 1. This will constrain the predictions to more realistically represent what we think to be true about the system.
 
-## Constrain 1901 predictions to zero
-```{r,eval=T,echo=F, warning=F,message=F}
+```{r zero_cons,eval=T,echo=F, warning=F,message=F}
 # create sequence from 0 to 1 for 1901 to 2010
 cons <- data.frame(cbind(1901:2010, seq(0,1,length.out=110)))
 colnames(cons) = c("yr","mult")
@@ -200,31 +241,35 @@ MO.pred.cons[,5:10] <- MO.pred.cons[,5:10]*MO.pred.cons$mult
 MO.pred.cons <- MO.pred.cons[,-11]
 
 ## Annual sums for plot
-MO.annual.predict.cons <- aggregate(.~yr, data = MO.pred.cons, sum, na.action = na.pass, na.rm=TRUE)
+MO.annual.predict.cons <- aggregate(.~yr, data = MO.pred.cons[,-(3:4)], sum, na.action = na.pass, na.rm=TRUE)
 MO.annual.predict.cons$actual[MO.annual.predict.cons$actual  == 0] <- NA
 MO.annual.predict.cons$actual[MO.annual.predict.cons$yr == 1901] <- 0
 ```
 
-```{r fig5,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Annual sums of model MGD predictions constrained at zero for 1901 from 173,670 individual well observations."}
+```{r fig5,eval=T,echo=F, warning=F,message=F,fig.align='center',fig.height=5, fig.width=6, fig.cap="Annual sums of model MGD predictions constrained at zero for 1901 from ~1600 individual well observations."}
 ## plot predictions
 dmelt.cons <- melt(MO.annual.predict.cons,id="yr")
 
 ggplot() + geom_line(data=subset(dmelt.cons,variable != "actual"),aes(yr,value,color=variable),size=1)  +
   geom_point(data=subset(dmelt.cons,variable == "actual"), aes(yr,value,fill=variable), shape=23, size = 3, alpha=0.9) + 
-  ylab("mgd") + theme_bw(base_size=14) + xlab("year") +  labs(color="Models") + scale_color_brewer(palette="Dark2") +
+  ylab("mgd") + theme_bw(base_size=12) + xlab("year") +  labs(color="Models") + scale_color_brewer(palette="Dark2") +
   labs(fill=NULL) + ggtitle("Zero-constrained models")
 ```
 
-## Maps
-```{r,eval=T,echo=F,warning=F,message=F,fig.align='center',cache=T}
-Mo.years <- subset(MO.pred.cons, yr %in% c(1905, 1930, 1970, 2010))
+## Discussion
+
+### MGD for select years
+Figures 3 and 4 are helpful to show how the annual sums of the models compared to actual. Below is a map of modeled mgd values through time for select year.
+
+```{r map1, eval=T, echo=F, fig.align='center', fig.cap="Annual MGD values predicted by the gradient boosting machine and constrained to zero in 1901.", fig.height=8, fig.width=6, message=F, warning=F, cache=T}
+Mo.years <- subset(MO.pred.cons, yr %in% c(1902, 1925, 1945, 1965, 1985, 2010))
 
 # custom theme for making clean maps
 theme_blank <- function(){
   theme(panel.background = element_rect(fill = "transparent",color=NA),
         plot.background = element_rect(fill = "transparent",color=NA),
         legend.background = element_rect(fill = "transparent",color=NA),
-        text = element_text(size=16),
+        text = element_text(size=12),
         axis.ticks = element_blank(),
         axis.text = element_blank(),
         axis.title = element_blank(),
@@ -238,19 +283,55 @@ state2 = subset(state, region == "missouri")
 
 m1 <- ggplot() + coord_fixed(1.3) 
 m1 <- m1 + geom_polygon(data=state2,aes(long,lat, group=group), 
-                       color = "black", fill= "grey90",size=1) 
-m1 <- m1 + geom_point(data=Mo.years, aes(long,lat,size=gbm), shape=21, fill ="dodgerblue", color = "black", alpha=0.6)
-m1 <- m1 + facet_wrap(~yr) + theme_blank() + labs(size="MGD")
+                       color = "black", fill= "grey15",size=1) 
+m1 <- m1 + geom_point(data=Mo.years, aes(long,lat,size=gbm), shape=21, fill ="cadetblue1", color = "black", alpha=0.9)
+m1 <- m1 + facet_wrap(~yr, ncol=2) + theme_blank() + labs(size="MGD") + scale_size_continuous(range = c(0.5,6))
+m1 <- m1 + ggtitle("Modeled Public Supply for select years")
 m1
 ```
+
+### MGD for 2010
+
+Below is a map of modeled mgd values for 2010 plotted over metropolitan (and micropolitan) statistical area boundaries. It is reassuring that the model predicts clusters of high mgd values for metro areas. 
+
+```{r, eval=T, echo=F, results='hide'}
+CBSA <- readOGR("C:\\Users\\scworlan\\Documents\\Water Conservation\\R_conservation\\MSA\\MSA",layer="cb_2013_us_cbsa_500k");
+CBSA2 <- spTransform(CBSA, CRS("+proj=longlat + datum=WGS84"));
+MSA2 <- fortify(CBSA2, region="NAME")
+MSA2$state <- substr(MSA2$id, nchar(MSA2$id)-4, nchar(MSA2$id))
+MO.MSA <- MSA2[which(grepl("MO", MSA2$state)==1),]
+MO.MSA <- MO.MSA[order(MO.MSA$order),]
+```
+
+```{r map2, eval=T, echo=F, fig.align='center', fig.cap="2010 MGD values predicted by gradient boosting machine.", fig.height=7, fig.width=6, message=F, warning=F, cache=T}
+
+Mo.2010<- subset(MO.pred.cons, yr == 2010)
+
+state = map_data('state')
+state2 = subset(state, region == "missouri")
+
+m2 <- ggplot() + coord_fixed(1.3) 
+m2 <- m2 + geom_polygon(data=state2,aes(long,lat, group=group), color = "black", fill= "grey15",size=1) 
+m2 <- m2 + geom_polygon(data = MO.MSA,aes(x = long, y = lat, group=group),alpha = 0.5, fill="white");
+m2 <- m2 + geom_polygon(data = MO.MSA,aes(x = long, y = lat, group=group),size=0.5, color="white", fill=NA)
+m2 <- m2 + geom_point(data=Mo.2010, aes(long,lat,size=gbm), shape=21, fill ="cadetblue1", color = "black", alpha=0.9)
+m2 <- m2 + theme_blank() + labs(size="MGD",color="Metro Areas") + scale_size_continuous(range = c(1,7))
+m2 <- m2 + ggtitle("Modeled Public Supply for 2010 with Metro Area Borders") 
+m2 <- m2 + theme(legend.position="none")
+m2
+```
+
+\newpage
 
 # Appendix
 
 ## Include precipitation and depth
-```{r fig6, ,eval=T,echo=T, warning=F,message=F,fig.align='center', fig.cap="Regression trees built with population (tree1) and with populations, depth, and precipitation (tree3)."}
+
+The models were built using population as the sole predictor. Below is a plot of the original regression tree model and a regression tree built using both population and precipiation^[depth was again excluded because of the high proportion of zero values which would confound the model). The multivariate prediction (tree2) does pass directly through more actual values, which suggest precipitation does provide some predictive power, but also introduces unrealistic variabiliy for certain years. 
+
+```{r fig6, ,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Regression trees built with population (tree1) and with population and precipitation (tree2).",fig.height=5, fig.width=6}
 set.seed(5)
-tree2 <- rpart(log.mgd ~ log.pop + precip + depth, data = mod.dat, weights=abs(1960-yr), 
-              control=rpart.control(minsplit=100, cp=0))
+tree2 <- rpart(log.mgd ~ log.pop + precip, data = mod.dat, control=rpart.control(minsplit=100, cp=0))
 
 # subset features
 MO.features2 <- MO.ps[,c(9,6,8,14,15)]
@@ -262,23 +343,41 @@ MO.predict2 <- data.frame(cbind(MO.ps$yr,
                                10^predict(tree, MO.features2),
                                10^predict(tree2, MO.features2)))
 
-colnames(MO.predict2) <- c("yr","actual","tree1","tree3")
+colnames(MO.predict2) <- c("yr","actual","tree1","tree2")
+
+
+MO.pred.cons2 <- merge(MO.predict2,cons,by="yr")
+
+# constrain predictions to be zero in 1901
+MO.pred.cons2[,3:4] <- MO.pred.cons2[,3:4]*MO.pred.cons2$mult
+MO.pred.cons2 <- MO.pred.cons2[,-5]
 
 ## Annual sums for plot
-MO.annual.predict2 <- aggregate(.~yr, data = MO.predict2, sum, na.action = na.pass, na.rm=TRUE)
-MO.annual.predict2$actual[MO.annual.predict2$actual  == 0] <- NA
-MO.annual.predict2$actual[MO.annual.predict2$yr == 1901] <- 0
+MO.annual.predict.cons2 <- aggregate(.~yr, data = MO.pred.cons2, sum, na.action = na.pass, na.rm=TRUE)
+MO.annual.predict.cons2$actual[MO.annual.predict.cons2$actual  == 0] <- NA
+MO.annual.predict.cons2$actual[MO.annual.predict.cons2$yr == 1901] <- 0
 
-dmelt2 <- melt(MO.annual.predict2,id="yr")
+
+dmelt2 <- melt(MO.annual.predict.cons2,id="yr")
 
 ggplot() + geom_line(data=subset(dmelt2,variable != "actual"),aes(yr,value,color=variable),size=1)  +
   geom_point(data=subset(dmelt2,variable == "actual"), aes(yr,value,fill=variable), shape=23, size = 3, alpha=0.9) + 
-  ylab("mgd") + theme_bw(base_size=14) + xlab("year") +  labs(color="Models") + 
+  ylab("mgd") + theme_bw(base_size=12) + xlab("year") +  labs(color="Models") + 
   scale_colour_manual(values = c("black","grey60")) + labs(fill=NULL) +
-  ggtitle("Regression trees with single predictor and three predictors")
+  ggtitle("Regression trees with single predictor and two predictors")
 
 ```
 
 
+```{r fig2_A,eval=T,echo=F,cache=F,warning=F,message=F, fig.align='center',fig.cap="Optimal parameters from training KNN model.",fig.height=5, fig.width=7}
+knn.cv <- melt(knn.train$MEAN.SQU)
+ggplot(knn.cv) + geom_line(aes(Var1,value,color=Var2), size=1)  +
+  xlab("K-neighbors") + ylab("RMSE") + theme_bw(base_size=12) + labs(color="kernel")
+```
+
+```{r fig3_A,eval=T,echo=F,cache=F,warning=F,message=F, fig.align='center',fig.cap="Optimal parameters from training GBM model.",fig.height=5, fig.width=7}
+#Plot training parameters
+ggplot(gbm1) + theme_bw(base_size=12)
+```
 
 
