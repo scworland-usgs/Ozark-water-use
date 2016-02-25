@@ -135,8 +135,30 @@ ggplot() + geom_line(data=subset(dmelt,variable != "actual"),aes(yr,value,color=
   labs(fill=NULL)
 
 
+## forloop for creating plots through time
+pth = "C:/Users/scworlan/Documents/MAP/OzarkWaterUse/Ozark-water-use/time_map_figures/lm"
 
+state = map_data('state')
+state2 = subset(state, region == "missouri")
+years <- 1901:2010
 
+for (i in 1:length(years)) {
+  MO.yr <- subset(MO.pred.cons[,c(1,3,4,5)], yr == years[i])
+  max.lm <- c(years[i], 51.5085300, -0.1257400, max(MO.pred.cons$lm))
+  min.lm <- c(years[i], 51.5085300, -0.1257400, min(MO.pred.cons$lm))
+  MO.yr <- rbind(MO.yr,max.lm,min.lm)
+  
+  m1 <- ggplot() + coord_fixed(1.3) 
+  m1 <- m1 + geom_polygon(data=state2,aes(long,lat, group=group), 
+                          color = "black", fill= "grey15",size=1) 
+  m1 <- m1 + geom_point(data=MO.yr, aes(long,lat,size=lm), shape=21, fill ="cadetblue1", color = "black", alpha=0.9)
+  m1 <- m1 +theme_blank() + labs(size="MGD") + scale_size_continuous(range = c(0.5,6)) 
+  m1 <- m1 + xlim(c(min(state2$long),max(state2$long))) + ylim(c(min(state2$lat),max(state2$lat)))
+  m1 <- m1 + ggtitle(paste("Groundwater pumping for public supply",years[i]," "))
+  
+  ggsave(m1,filename=paste("MO_ps_wateruse_mars",i,".png",sep=""),path=pth)
+  
+}
 
 
 

@@ -1,6 +1,6 @@
 ---
 title: "Modeling public supply water use in Missouri from 1901-2010"
-author: "Scott Worland"
+author: "Scott Worland (scworland@usgs.gov), K. Knierim, & B. Clark"
 date: "February 22, 2016"
 output: 
   pdf_document: 
@@ -12,7 +12,11 @@ output:
       in_header: preamble-latex.tex
 ---
 
+\newpage
+
 # Methods
+
+This document summarizes the statistical modeling efforts for back-casting public supply water use for 1579 groundwater wells for a portion of Missouri (MO) from 1901-2010. Although the Ozark groundwater model has a larger spatial domain than what is represented here, we chose public supply for only the state of MO because it is considered the highest quality data in the dataset. The ideas was, if the modeling effort proved successful for this particular data, then it might make sense to try extend the methods to other divisions and states. The structure of the document is informal, and will be substantially distilled for the methods section of a report. I included short snippets of R code where I felt that it may be helpful. The source file used to create this document can be found on GitHub [here](https://github.com/scworland-usgs/Ozark-water-use/blob/master/MO_water_use.Rmd).
 
 ## Data pre-processing
 ```{r libs,eval=T,echo=F,warning=F,message=F}
@@ -22,12 +26,12 @@ library(kknn); library(randomForest); library(gbm);
 library(caret); library(doParallel); library(gridExtra);
 library(earth); library(RColorBrewer); library(ggmap);
 library(grid); library(rgdal); library(rgeos);
-library(maptools)
+library(maptools); library(knitr); library(rpart.plot)
 
 setwd("C:/Users/scworlan/Documents/MAP/OzarkWaterUse/Ozark-water-use")
 ```
 
-Begin by reading in the raw data and completing some basic pre-processing steps,
+Begin by reading in the raw data and completing some basic pre-processing steps. Comments are provided for each step below.
 
 ```{r data,eval=T,echo=T,warning=F,message=F}
 # Load raw data (from B. Clarke 12/23/2015)
@@ -42,7 +46,7 @@ MO.raw$mgd[MO.raw$mgd==0] <- NA # remove mgd=0 values because they are an artifa
 MO.ps <- subset(MO.raw, divs == "Public Supply") # subset public supply
 ```
 
-Before we start building the models, let's look at how the predictors are related to MGD. The log transformation of population and MGD are shown in figure 1. The justification for this is further addressed below.
+Before we start building the models, let's look at how the predictors are related to MGD. The log transformation of population and MGD are shown in Figure 1. The justification for this is further addressed below.
 
 ```{r fig1_pairs,eval=T,echo=F, fig.align='center', cache=T, warning=F,message=F, fig.height=5, fig.width=6, fig.cap="Pairs plot of predictors and log10(mgd)"}
 pairs.data <- MO.ps[complete.cases(MO.ps),c(9,6,8,14,15)]
@@ -56,9 +60,9 @@ ggpairs(pairs.data.plot, upper=list(continuous = wrap("points", alpha = 0.2, siz
         columnLabels = colnames(pairs.data.plot)) + theme_bw(base_size=8)
 ```
 
-Population and depth are both correlated with MGD, and are also somewhat correlated with eachother (Figure 1). Because depth has zero for almost 25% of its values, and provides similar information to population, we can not use depth as a predictor. Precipitation is not correlated with MGD and will not add explanatory power to linear models, and can also be dropped from the analysis^[Various non-linear models were built that included precipitation, well depth, and geographic coordinates. The RMSE from the cross-validated predictions were over 100% greater than when they were excluded. Figure 8 in Appendix A is an example.].
+Population and depth are both correlated with MGD, and are also somewhat correlated with each other (Figure 1). Because depth has an erroneous value of zero for almost 25% of its values, and provides similar information to population, we will not use depth as a predictor. Precipitation is not correlated with MGD and will not add explanatory power to linear models, and can also be dropped from the analysis^[Various non-linear models were built that included precipitation, well depth, and geographic coordinates. The RMSE from the cross-validated predictions were over 100% greater than when they were excluded. Figure 8 in Appendix A is an example.].
 
-The response variable (mgd) must be greater than zero, and we will place this constraint on the models by taking the log transformation of mgd. When we exponentiate the predictions post-modeling we are gauranteed a postive value (for any real $a$, $10^a > 0$).
+The response variable (mgd) must be greater than zero, and we will place this constraint on the models by taking the log transformation of mgd. When we exponentiate the predictions post-modeling we are guaranteed a positive value (for any real $a$, $10^a > 0$).
 
 ```{r mod_data,eval=T,echo=T,warning=F,message=F}
 MO.ps$mgd[MO.ps$yr==1901] <- min(MO.ps$mgd,na.rm=T)
@@ -90,7 +94,7 @@ mod.dat[,c(4:8,10)] <- scale(mod.dat[,c(4:8,10)]) # scale the predictors
 
 ### Linear Regression
 
-A weighted least squares linear regression model was built to predict mgd using population. Both an intercept parameter ($\theta_0$) and a slope parameter ($\theta_1$) were estimated. The observations were weighted by years, where heavier weights were placed on observations that fall within the earlier and later years. This was done to emphasize closer fits at the begining and end of the time series. A similar apprach was taken for several of the other models below. 
+A weighted least squares linear regression model was built to predict mgd using population. Both an intercept parameter ($\theta_0$) and a slope parameter ($\theta_1$) were estimated. The observations were weighted by years, where heavier weights were placed on observations that fall within the earlier and later years. This was done to emphasize closer fits at the beginning and end of the time series.  
 
 ```{r lm,eval=T,echo=T}
 # Linear model
@@ -100,7 +104,7 @@ lm <- lm(log.mgd ~ log.pop, data = mod.dat, weights=abs(1950-yr))
 
 ### K-Nearest Neighbors Regression
 
-A KNN regression model was built to predict mgd using population. The KNN model predicts a new value of the response variable using the K-closest samples from the data that was used to train the model^[where "closest" here is defined by a generalization of Euclidean distances, although there are other alternatives that can produce comparable results]. For example, to predict a new mgd value KNN regression finds the K-nearest neighbors (K is a tuning parameter chosen through cross validation) in the predictor space, just population for this example, and assigns mean mgd value associated with those population values as the prediction. Basic KNN regression does not account for the relative distances *between* the K closeset neighbors and the new point. There are no weights placed on the mgd values used to make the prediction. If we want to reduce the bias, we would like for closer neighbors to receive higher weights, and if we want to reduce the variance, we might want the opposite. One way to accomplish this is to use a kernel (weighting function) on the euclidean distances. We can train the model using different K neighbors and kernels and choose the optimal parameters using cross validation,
+A KNN regression model was built to predict mgd using population. The KNN model predicts a new value of the response variable using the K-closest samples from the data that was used to train the model^[where "closest" here is defined by a generalization of Euclidean distances, although there are other alternatives that can produce comparable results]. For example, to predict a new mgd value KNN regression finds the K-nearest neighbors (K is a tuning parameter chosen through cross validation) in the predictor space, just population for this model, and generates a prediction by taking the mean mgd value associated with the k-nearest population. Basic KNN regression does not account for the relative distances *between* the K closest neighbors and the new point. There are no weights placed on the mgd values used to make the prediction. If we want to reduce the bias, we would like for closer neighbors to receive higher weights, and if we want to reduce the variance, we might want the opposite. One way to accomplish this is to use a kernel (weighting function) on the euclidean distances. We can train the model using different K neighbors and kernels and choose the optimal parameters using cross validation,
 
 ```{r knn,eval=T,echo=T, cache=T}
 # K-nearest neighbors
@@ -109,11 +113,11 @@ knn.train <- train.kknn(log.mgd ~ log.pop, data = mod.dat,  kmax = 100,
                                    "gaussian", "triweight"));
 ```
 
-A plot of the training parameters can be found in Figure 8 in Appendix A. 
+A plot of the training parameters can be found in Figure 9 in Appendix A. 
 
 ### Single Regression Tree
 
-A regression tree was built to predict mgd using population. Regression trees partitions the predictor space through a set of recursive binary splits and predicts the target variable based on the mean values of the features contained within the partitions. The splits are chosen based on a reduction in error associated with the split. The individual splits are chosen based on a greedy algorithm, meaning that it optimizes the local split and does not attempt a global optimum which would be computationally expensive. Unlike simple least-squared methods, decision trees can learn very irregular patterns and produce models with very low bias but high variance.
+A regression tree was built to predict mgd using population. Regression trees partition the predictor space through a set of recursive binary splits and predicts the target variable based on the mean values of the features contained within the partitions. The splits are chosen based on a reduction in error associated with the split. The individual splits are chosen based on a greedy algorithm, meaning that it optimizes the local split and does not attempt a global optimum which would be computationally expensive. Unlike simple least-squared methods, decision trees can learn very irregular patterns and produce models with very low bias but often suffer from high variance.
 
 ```{r tree,eval=T,echo=T, cache=T}
 # regression tree
@@ -122,31 +126,15 @@ tree <- rpart(log.mgd ~ log.pop, data = mod.dat,
               control=rpart.control(minsplit=100, cp=0))
 ```
 
-### Multivaraite Adaptive Regression Spline
-
-A multivariate adaptive regression spline (MARS) model was built to predict mgd using population. Mars models are similar to piecewise linear models in that the predictor is divided into groups and separate linear models are built for each group. The first cut point is chosen by considering each data point for the predictor, building linear regression models on each side of the cut point, and calculating the prediction error. The cut point which provides the lowest prediction error is chosen. The processes is repeated until the reduction in error is below some threshold. The model is built in R using the following script.
-
-```{r mars,eval=T,echo=T, cache=T}
-# MARS model
-mars <- earth(log.mgd ~ log.pop, data = mod.dat,weights=abs(1960-yr))
-```
-
-The resulting model selected 7 cut points on population with varying $\theta_1$ parameters and a single $\theta_0$ parameter. 
-
-### Local Polynomial Regression 
-
-A local polynomial regression (LOESS) model was built to predict mgd using population. LOESS models use a combination of techniques that blends MARS and KNN regression models. A local model is built for each observation and set of the neighboring observations. The number of neighbors is chosen by providing a value $\alpha$, or the "span", which is just a fraction of the total observations. For LOESS, a polynomial regression model is fit to only the neighbors within $\alpha$ of the the current observation. A separate model is build for each observation and it's neighbors, and the fitted value for that observation is recorded. After all the models are built, the fitted values are connected, producing the local polynomial nonparametric regression curve.
-
-```{r loess,eval=T,echo=T, cache=T}
-# LOESS model
-poly <- loess(log.mgd ~ log.pop, data = mod.dat, span = 100/nrow(mod.dat))
-```
+One way to reduce the variance in regression trees is to use an ensemble method, such as random forest or gradient boosting machines.
 
 ### Gradient Boosting Machine
 
-A gradient boosting machine (gbm) was used to generate predictions of mgd based on population. GBMs are one of the most powerful ensemble methods in machine learning. Gradient boosting is an algortithm to ensemble the predictions of an additive model consisting of weak base learners and models built on the residuals of the base learner and subsequent residual models. The name "gradient boosting" comes from the the relationship to gradient descent algorithms used to optimize many statistical models (the residuals of a model is the gradient). 
+A gradient boosting machine (gbm) was used to generate predictions of mgd based on population. GBMs are one of the most powerful ensemble methods in machine learning. Gradient boosting is an algorithm to ensemble the predictions of an additive model consisting of weak base learners and models built on the residuals of the base learner and subsequent residual models. The name "gradient boosting" comes from the the relationship to gradient descent algorithms used to optimize many statistical models (the residuals of a model *is* the gradient). 
 
-A regression tree was used as the weak base learner below. The algorithm proceeds as follows: (1) select tree depth and number of iterations^[in practice this is optimized by cross validation and can be visualized in Figure 9 of Appendix A] (2) build a single regression tree on the data, (3) calculate the residuals from the first model, (4) fit a new regression tree *using the residuals from the first model* as the response variable, (5) add the predictions from number 4 to number 3, (6) repeat. This profoundly simple algorithm works because the magnitude of the residuals of the basse learner can be thought of as a measure of how well the model fit the data. Large residuals are where the model did poorly, and small residuals are where the model fit well. When a model is built *on* the residuals, then it is effectively *boosting* the predictions where the first model did poorly. If the base learner under-predicted an observation (postive residual), then a model on the residuals will often predict a positive value (0 < $\hat{y_2}$ < ($y_1 - \hat{y_1}$), which will be added to the original prediction, hence moving it upwards closer to the actual value. If the residual model happens to predicts a postive value greater than the residual from the first model ($\hat{y_2}$ > ($y_1 - \hat{y_1}$)^[this is more common for small residuals, and it makes little difference in the final outcome], meaning the prediction is now over-estimated, then the next iteration should predict a negative value and move the prediction downwards closer to the actual. The model needs to be trained over its tuning paramers. The implentation for this in R is seen below (takes ~1.5 hrs to run when parallelized over two cores),
+A regression tree was used as the weak base learner below. The algorithm proceeds as follows: (1) select tree depth and number of iterations^[in practice this is optimized by cross validation and can be visualized in Figure 9 of Appendix A] (2) build a single regression tree on the data, (3) calculate the residuals from the first model, (4) fit a new regression tree *using the residuals from the first model* as the response variable, (5) add the predictions from number 4 to number 3, (6) repeat. This profoundly simple algorithm works because the magnitude of the residuals of the base learner can be thought of as a measure of how well the model fit the data. Large residuals are where the model did poorly, and small residuals are where the model fit well. When a model is built *on* the residuals, then it is effectively *boosting* the predictions where the first model did poorly. 
+
+If the base learner over-predicted an observation (negative residual, 0 > $y_1 - \hat{y_1}$), then a model on the residuals will predict a negative value (0 > $\hat{y_2}$), which will be added to the original prediction, hence moving the gloabal prediction closer to the actual value. The reverse is also true. Because this is an important part of this work, I included a short tutorial in Appendix B. The implementation for this in R is seen below (takes ~1.5 hrs to run when parallelized over two cores),
 
 ```{r gbm,eval=F,echo=T,cache=T,warning=F,message=F}
 # 10-fold cross validation
@@ -174,6 +162,26 @@ gbm1 <- caret::train(log.mgd ~ log.pop, data = mod.dat,
 stopCluster(cl)
 
 proc.time() - ptm # Stop the clock
+```
+
+### Multivaraite Adaptive Regression Spline
+
+A weighted multivariate adaptive regression spline (MARS) model was built to predict mgd using population. MARS models are similar to piece-wise linear models in that the predictor is divided into groups and separate linear models are built for each group. The first cut point is chosen by considering each data point for the predictor, building linear regression models on each side of the cut point, and calculating the prediction error. The cut point which provides the lowest prediction error is chosen. The processes is repeated until the reduction in error is below some threshold. The model is built in R using the following script.
+
+```{r mars,eval=T,echo=T, cache=T}
+# MARS model
+mars <- earth(log.mgd ~ log.pop, data = mod.dat,weights=abs(1960-yr))
+```
+
+The resulting model selected 7 cut points on population with varying $\theta_1$ parameters and a single $\theta_0$ parameter. 
+
+### Local Polynomial Regression 
+
+A local polynomial regression (LOESS) model was built to predict mgd using population. LOESS models use a combination of techniques that blends MARS and KNN regression models. A local model is built for each observation and set of the neighboring observations. The number of neighbors is chosen by providing a value $\alpha$, or the "span", which is just a fraction of the total observations. For LOESS, a polynomial regression model is fit to only the neighbors within $\alpha$ of the the current observation. A separate model is build for each observation and it's neighbors, and the fitted value for that observation is recorded. After all the models are built, the fitted values are connected, producing the local polynomial non-parametric regression curve.
+
+```{r loess,eval=T,echo=T, cache=T}
+# LOESS model
+poly <- loess(log.mgd ~ log.pop, data = mod.dat, span = 100/nrow(mod.dat))
 ```
 
 ```{r predict,eval=T,echo=F, cache=T,warning=F,message=F}
@@ -228,7 +236,7 @@ ggplot() + geom_line(data=subset(dmelt,variable != "actual"),aes(yr,value,color=
 ```
 
 ### Constrain 1901 predictions to zero
-All of the models did poorly for the early years. This is not due to the models "failing" but due to the large amount of bias introduced to the models because most of the observations with actual values are for the years 1970-201 (the actual value of zero was added as a constraint and is not actually and actual). The models fit the data well where there were a large number of observations. We can add a simple multiplier *post prediction* to force the models to predict  zero mgd value for 1901. Basically, we create a numeric vector ranging from zero to one that is the same length as the total number of years. We then multiply the predictions by the fraction in this vector. For example, predictions for 1901 are multiplied by 0, predictions for ~1955 are multiplied by 0.5, and predictions for 2010 are multiplied by 1. This will constrain the predictions to more realistically represent what we think to be true about the system.
+All of the models did poorly for the early years. This is not due to the models "failing" but due to the large amount of bias introduced to the models because most of the observations with actual values are for the years 1970-201 (the actual value of zero was added as a constraint and is not actually an actual). The models fit the data well where there were a large number of observations. We can add a simple multiplier *post prediction* to force the models to predict  zero mgd value for 1901. Basically, we create a numeric vector ranging from zero to one that is the same length as the total number of years. We then multiply the predictions by the fraction in this vector. For example, predictions for 1901 are multiplied by 0, predictions for ~1955 are multiplied by 0.5, and predictions for 2010 are multiplied by 1. This will constrain the predictions to more realistically represent what we think to be true about the system.
 
 ```{r zero_cons,eval=T,echo=F, warning=F,message=F}
 # create sequence from 0 to 1 for 1901 to 2010
@@ -259,7 +267,7 @@ ggplot() + geom_line(data=subset(dmelt.cons,variable != "actual"),aes(yr,value,c
 ## Discussion
 
 ### MGD for select years
-Figures 3 and 4 are helpful to show how the annual sums of the models compared to actual. Below is a map of modeled mgd values through time for select year.
+Figures 3 and 4 are helpful to show how the annual sums of the models compared to actual. Below is a map of modeled mgd values through time for select years.
 
 ```{r map1, eval=T, echo=F, fig.align='center', fig.cap="Annual MGD values predicted by the gradient boosting machine and constrained to zero in 1901.", fig.height=8, fig.width=6, message=F, warning=F, cache=T}
 Mo.years <- subset(MO.pred.cons, yr %in% c(1902, 1925, 1945, 1965, 1985, 2010))
@@ -292,7 +300,7 @@ m1
 
 ### MGD for 2010
 
-Below is a map of modeled mgd values for 2010 plotted over metropolitan (and micropolitan) statistical area boundaries. It is reassuring that the model predicts clusters of high mgd values for metro areas. 
+Below is a map of modeled mgd values for 2010 plotted over metropolitan (and micropolitan) statistical area boundaries. It is reassuring that the model predicts clusters of high public supply mgd values for metro areas! 
 
 ```{r, eval=T, echo=F, results='hide'}
 CBSA <- readOGR("C:\\Users\\scworlan\\Documents\\Water Conservation\\R_conservation\\MSA\\MSA",layer="cb_2013_us_cbsa_500k");
@@ -303,9 +311,10 @@ MO.MSA <- MSA2[which(grepl("MO", MSA2$state)==1),]
 MO.MSA <- MO.MSA[order(MO.MSA$order),]
 ```
 
-```{r map2, eval=T, echo=F, fig.align='center', fig.cap="2010 MGD values predicted by gradient boosting machine.", fig.height=7, fig.width=6, message=F, warning=F, cache=T}
+```{r map2, eval=T, echo=F, fig.align='center', fig.cap="2010 MGD values predicted by the gradient boosting machine.", fig.height=7, fig.width=6, message=F, warning=F, cache=T}
 
-Mo.2010<- subset(MO.pred.cons, yr == 2010)
+MO.2010 <- subset(MO.pred.cons, yr == 2010)
+MO.2010$residuals <- rowMeans(MO.2010[,5:10]) - MO.2010$actual
 
 state = map_data('state')
 state2 = subset(state, region == "missouri")
@@ -314,24 +323,79 @@ m2 <- ggplot() + coord_fixed(1.3)
 m2 <- m2 + geom_polygon(data=state2,aes(long,lat, group=group), color = "black", fill= "grey15",size=1) 
 m2 <- m2 + geom_polygon(data = MO.MSA,aes(x = long, y = lat, group=group),alpha = 0.5, fill="white");
 m2 <- m2 + geom_polygon(data = MO.MSA,aes(x = long, y = lat, group=group),size=0.5, color="white", fill=NA)
-m2 <- m2 + geom_point(data=Mo.2010, aes(long,lat,size=gbm), shape=21, fill ="cadetblue1", color = "black", alpha=0.9)
+m2 <- m2 + geom_point(data=MO.2010, aes(long,lat,size=gbm), shape=21, fill ="cadetblue1", color = "black", alpha=0.9)
 m2 <- m2 + theme_blank() + labs(size="MGD",color="Metro Areas") + scale_size_continuous(range = c(1,7))
 m2 <- m2 + ggtitle("Modeled Public Supply for 2010 with Metro Area Borders") 
 m2 <- m2 + theme(legend.position="none")
 m2
+
+```
+
+```{r map.resid, eval=T, echo=F, fig.align='center', fig.cap="Residuals for 2010 public supply predictions. The residuals were calculated by subtracting the actual value from the mean of all models for each well. Orange points are where the model underpredicted the actual and purpole points are where the model over predicted to actual.", fig.height=7, fig.width=6, message=F, warning=F, cache=T}
+
+MO.2010.resid <- MO.2010[complete.cases(MO.2010),]
+MO.2010.resid$resid2 <- cut(MO.2010.resid$residual*1000000, breaks=c(-3e9, -7e4, -1e4, 0, 1e4, 7e4, 3e5), 
+              labels=c("-3000k to -70k", "-70k to -10k", "-10k to 0", "0 to 10k", "10k to 70k", "70k to 300k"), include.lowest=TRUE)
+
+
+m3 <- ggplot() + coord_fixed(1.3) 
+m3 <- m3 + geom_polygon(data=state2,aes(long,lat, group=group), color = "black", fill= "grey65",size=1) 
+m3 <- m3 + geom_point(data=MO.2010.resid, aes(long,lat,fill=resid2),size=4, shape=21, color ="black", alpha=0.8)
+m3 <- m3 + scale_fill_brewer(palette="PuOr")
+m3 <- m3 + theme_blank() + labs(fill="residuals (gal/day)") 
+m3 <- m3 + ggtitle("Residuals from Modeled Public Supply for 2010") 
+m3
 ```
 
 \newpage
 
-# Appendix
+# Appendix A: Training plots and multivariate models
 
 ## Include precipitation and depth
 
-The models were built using population as the sole predictor. Below is a plot of the original regression tree model and a regression tree built using both population and precipiation^[depth was again excluded because of the high proportion of zero values which would confound the model). The multivariate prediction (tree2) does pass directly through more actual values, which suggest precipitation does provide some predictive power, but also introduces unrealistic variabiliy for certain years. 
+The models were built using population as the sole predictor. Below is a plot of the original regression tree model, the original gradient boosted model and a regression tree and a gradient boosted model built using both population and precipitation^[depth was again excluded because of the high proportion of zero values which would confound the model]. The multivariate prediction (tree2, gbm2) does have a lower cross-validated RMSE than the models built on population alone, which suggest precipitation does provide some predictive power, but also introduces unrealistic variability for certain years. 
 
-```{r fig6, ,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Regression trees built with population (tree1) and with population and precipitation (tree2).",fig.height=5, fig.width=6}
+```{r gbm2,eval=F,echo=T,cache=T,warning=F,message=F}
+# Regression tree with population and precipitation
+
+set.seed(5)
+tree2 <- rpart(log.mgd ~ log.pop + precip, data = mod.dat, 
+               control=rpart.control(minsplit=100, cp=0))
+
+# Gradient boosting with population and precipitation
+
+# 10-fold cross validation
+fitControl <- trainControl(method = "cv", number = 10)
+
+# Create grid of training parameters
+gbmGrid <-  expand.grid(.interaction.depth = seq(20,45,by=5),
+                        .n.trees = c(10,50,100,500,1000,5000,10000),
+                        .shrinkage = c(0.1),
+                        .n.minobsinnode=100)
+
+# Registers available cores
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+ptm <- proc.time() # Start the clock
+
+# Train model
+set.seed(100)
+gbm2 <- caret::train(log.mgd ~ log.pop + precip, data = mod.dat,
+                        method = "gbm",
+                        verbose = FALSE,
+                        tuneGrid = gbmGrid)
+
+stopCluster(cl)
+
+proc.time() - ptm # Stop the clock
+```
+
+```{r fig1_A, ,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Regression trees and gradient boosting models built with population (tree1, gbm1) and with population and precipitation (tree2,gbm2).",fig.height=5, fig.width=6, cache=T}
 set.seed(5)
 tree2 <- rpart(log.mgd ~ log.pop + precip, data = mod.dat, control=rpart.control(minsplit=100, cp=0))
+
+load("gbm2.rda")
 
 # subset features
 MO.features2 <- MO.ps[,c(9,6,8,14,15)]
@@ -341,16 +405,17 @@ MO.features2[,3:6] <- scale(MO.features2[,3:6])
 MO.predict2 <- data.frame(cbind(MO.ps$yr,
                                MO.ps$mgd,
                                10^predict(tree, MO.features2),
-                               10^predict(tree2, MO.features2)))
+                               10^predict(tree2, MO.features2),
+                               10^predict(gbm1, MO.features2),
+                               10^predict(gbm2, MO.features2)))
 
-colnames(MO.predict2) <- c("yr","actual","tree1","tree2")
-
+colnames(MO.predict2) <- c("yr","actual","tree1","tree2","gbm","gbm2")
 
 MO.pred.cons2 <- merge(MO.predict2,cons,by="yr")
 
 # constrain predictions to be zero in 1901
-MO.pred.cons2[,3:4] <- MO.pred.cons2[,3:4]*MO.pred.cons2$mult
-MO.pred.cons2 <- MO.pred.cons2[,-5]
+MO.pred.cons2[,3:6] <- MO.pred.cons2[,3:6]*MO.pred.cons2$mult
+MO.pred.cons2 <- MO.pred.cons2[,-7]
 
 ## Annual sums for plot
 MO.annual.predict.cons2 <- aggregate(.~yr, data = MO.pred.cons2, sum, na.action = na.pass, na.rm=TRUE)
@@ -363,11 +428,11 @@ dmelt2 <- melt(MO.annual.predict.cons2,id="yr")
 ggplot() + geom_line(data=subset(dmelt2,variable != "actual"),aes(yr,value,color=variable),size=1)  +
   geom_point(data=subset(dmelt2,variable == "actual"), aes(yr,value,fill=variable), shape=23, size = 3, alpha=0.9) + 
   ylab("mgd") + theme_bw(base_size=12) + xlab("year") +  labs(color="Models") + 
-  scale_colour_manual(values = c("black","grey60")) + labs(fill=NULL) +
-  ggtitle("Regression trees with single predictor and two predictors")
+  ggtitle("Models with population and precipitation")
 
 ```
 
+## Training KNN
 
 ```{r fig2_A,eval=T,echo=F,cache=F,warning=F,message=F, fig.align='center',fig.cap="Optimal parameters from training KNN model.",fig.height=5, fig.width=7}
 knn.cv <- melt(knn.train$MEAN.SQU)
@@ -375,9 +440,156 @@ ggplot(knn.cv) + geom_line(aes(Var1,value,color=Var2), size=1)  +
   xlab("K-neighbors") + ylab("RMSE") + theme_bw(base_size=12) + labs(color="kernel")
 ```
 
+## Training GBM
+
 ```{r fig3_A,eval=T,echo=F,cache=F,warning=F,message=F, fig.align='center',fig.cap="Optimal parameters from training GBM model.",fig.height=5, fig.width=7}
 #Plot training parameters
 ggplot(gbm1) + theme_bw(base_size=12)
+```
+
+## Actual vs predicted
+```{r fig4_A,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Pairs plot of  the log transformed modeled predictions vs the log transformed actual.",fig.height=5, fig.width=6}
+
+MO.pred.cons.complete <- MO.pred.cons[complete.cases(MO.pred.cons),c(2,5:10)]
+
+ggpairs(log10(MO.pred.cons.complete), upper=list(continuous = wrap("points", alpha = 0.2, size=0.1), discrete = "blank", na = "blank"), diag=list(continuous = "barDiag", discrete = "blankDiag", na = "blankDiag"), lower=list(continuous = wrap("density", size=0.2), discrete="blank", na="blank"),columnLabels = colnames(MO.pred.cons.complete)) + theme_bw(base_size=8)
+
+knitr::kable(tail(round(MO.pred.cons.complete,4),10), format = "latex", caption = "Last 10 rows zero-constrained prediction table",
+             row.names = NA, booktabs = T)
+```
+
+# Appendix B: Simple Gradient Boosting Machine
+
+This appendix provides a short, arm wavy, non mathematical example of a gradient boosting machine. The mathematics are relatively straightforward if you are already familiar with the gradient descent algorithm. A concise mathematical treatment can be found starting on slide 28 of the presentation [here.](http://www.ccs.neu.edu/home/vip/teach/MLcourse/4_boosting/slides/gradient_boosting.pdf)
+
+First we will generate data with a non-linear response $y$ on $x$,
+                 
+```{r fig1_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Fake data with a non-linear relationship.",fig.height=3, fig.width=5}
+# create non-linear data
+set.seed(1)
+x = 1:25
+df <- data.frame(x=x, 
+                 y=c((10 + 0.5*x[1:12]),(6 + -0.2*x[13:25])) + runif(length(x),0,3))
+
+#knitr::kable(df, format = "latex", caption = "Fake data", row.names = NA, booktabs = T)
+
+ggplot(df) + geom_point(aes(x,y),size=2) + ylim(0,20)
+```
+
+The next step is to start with a weak base learner. For simplicity, we will just use a regression tree with one split, meaning only two values will be predicted which minimizes the error. 
+
+```{r fig2_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Plot of decision tree with one split.",fig.height=2, fig.width=4}
+
+# Base learner
+set.seed(5)
+tbase <- rpart(y~x, data = df)
+df$yhat1 <- predict(tbase)
+df$r <- df$y - df$yhat
+
+prp(tbase)
+```
+
+The interpretation of Figure 13 is as simple as it looks: predict y = 3.9 for any x >= to 12, and predict y = 15 for any x < 12. 3.9 and 15 are the mean y values on either side of the split at x = 12. We can plot the fitted values on the original data,
+
+```{r fig3_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Fitted regression tree.",fig.height=3, fig.width=5}
+ggplot(df) + geom_point(aes(x,y),size=2) + ylim(0,20) + geom_line(aes(x,yhat1), color = "blue")
+```
+
+This fit actually is actually pretty good for one tree. Let's see if gradient boosting can make it any better. The residuals are the difference between the observed data (black points) and predicted (blue line),
+```{r fig4_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Fitted regression tree with residuals shown.",fig.height=3, fig.width=5}
+ggplot(df)  + geom_line(aes(x,yhat1), color="blue") + geom_segment(aes(x=x, y=y, xend=x, yend=yhat1), color="red") + 
+  geom_point(aes(x,y),size=2) + ylim(0,20) + ylab("y")
+```
+
+Now if we subtract the blue line from the black points ($y-\hat{y}$) we are left with the residuals,
+
+```{r fig5_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Rediduals from base learner.",fig.height=3, fig.width=5}
+ggplot(df)  + geom_point(aes(x,r)) + geom_hline(aes(yintercept=0), color = "blue") + ylim(-4,4) +
+  geom_segment(aes(x=x, y=0, xend=x, yend=r), color="red") + ylab("residuals")
+```
+
+The next step is to build a model *on* the residuals,
+
+```{r fig6_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Plot of decision tree with one split for residuals.",fig.height=2, fig.width=5}
+
+set.seed(5)
+t1 <- rpart(r~x, data = df)
+df$yhat2 <- predict(t1)
+
+prp(t1)
+```
+
+Plot the fitted model on the residuals,
+
+```{r fig7_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Fitted regression tree on residuals from base learner.",fig.height=3, fig.width=5}
+
+ggplot(df) + geom_point(aes(x,r),size=2) + ylim(-4,4) + geom_line(aes(x,yhat2), color = "blue") + ylab("residuals")
+
+```
+
+By looking at the fit it is clear that the model could do a much better job if we allowed another split. The regression tree algorithm would likely select another split at x = 20, with a y prediction around -1.5. However, for simplicity, we will keep it to only one split here. Now the additive part: add the fitted models (blue lines) from figure 18 and figure 14,
+
+```{r fig8_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Plot of boosted decision tree.",fig.height=3, fig.width=5}
+
+ggplot(df) + geom_point(aes(x,y),size=2) + ylim(0,20) + geom_line(aes(x,yhat1+yhat2), color = "blue")
+
+```
+
+and we can see the fit has improved. If it is not clear why that improved the fit, just take a close look at the response values associated with the two blue lines. Note how the residual model adjust to where the base model either over or under predicted the original data. That's gradient boosting! Now let's run this through 6 iterations to show how it improves each time,
+
+```{r fig9_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Plot of boosted decision trees.",fig.height=4, fig.width=7}
+iterations = 6
+
+yhats <- matrix(ncol=iterations, nrow=nrow(df))
+resid <- matrix(ncol=iterations, nrow=nrow(df))
+yhats[,1] <- df$yhat1
+resid[,1] <- df$r
+  
+for(i in 1:(iterations-1)){
+  set.seed(5)
+  t <- rpart(r~x, data = df)
+  yhats[,i+1] <- yhats[,i] + predict(t)
+  df$r <- df$y - yhats[,i+1]
+  resid[,i+1] <- df$r
+}
+
+# plot the fit
+df2 <- cbind(df[,1],data.frame(yhats))
+colnames(df2) = c("x","iteration 1","iteration 2","iteration 3","iteration 4","iteration 5","iteration 6")
+dfm <- melt(df2, id.vars = "x")
+
+fit1 <- ggplot() + geom_point(data=df,aes(x,y)) + geom_line(data=dfm, aes(x,value,color=variable),size=1) 
+fit1 <- fit1 + facet_wrap(~variable) + theme(legend.position="none")
+fit1
+```
+
+The quality of the fit increases up to iteration 5, then stays the same. This is because the best model that could be built on the residuals is a single prediction zero, meaning that further iterations will not improve the fit (remember it is additive, so adding zero doens't change the global prediction). The residual models can be visualized in a similar way^[there will be one less residual model than the number of iterations, because the first step is to use the base learner, which creates the first set of residuals],
+
+```{r fig10_B,eval=T,echo=F,cache=T,warning=F,message=F, fig.align='center',fig.cap="Plot of decision trees with one split for residuals.",fig.height=4, fig.width=7}
+# plot residuals with models
+
+df3 <- cbind(df[,1],data.frame(resid[,1:5]))
+colnames(df3) <- c("x","residual model 1","residual model 2","residual model 3",
+                   "residual model 4","residual model 5")
+
+models <- matrix(ncol=iterations-1, nrow=nrow(df))
+
+for (i in 1:iterations-1){
+  models[,i] <- predict(rpart(df3[,i+1] ~ df3[,1]))
+}
+
+df4 <- cbind(df[,1], data.frame(models))
+colnames(df4) <- colnames(df3)
+
+df3m <- melt(df3, id.vars="x")
+df4m <- melt(df4, id.vars="x")
+
+fit2 <- ggplot() + geom_point(data=df3m,aes(x,value)) + ylab("residual")
+fit2 <- fit2 + geom_line(data=df4m,aes(x,value,color=variable),size=1) 
+fit2 <- fit2 + facet_wrap(~variable) + theme(legend.position="none")
+fit2
+
+
 ```
 
 
