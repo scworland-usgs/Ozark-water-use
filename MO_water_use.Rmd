@@ -60,7 +60,7 @@ ggpairs(pairs.data.plot, upper=list(continuous = wrap("points", alpha = 0.2, siz
         columnLabels = colnames(pairs.data.plot)) + theme_bw(base_size=8)
 ```
 
-Population and depth are both correlated with MGD, and are also somewhat correlated with each other (Figure 1). Because depth has an erroneous value of zero for almost 25% of its values, and provides similar information to population, we will not use depth as a predictor. Precipitation is not correlated with MGD and will not add explanatory power to linear models, and can also be dropped from the analysis^[Various non-linear models were built that included precipitation, well depth, and geographic coordinates. The RMSE from the cross-validated predictions were over 100% greater than when they were excluded. Figure 8 in Appendix A is an example.].
+Population and depth are both correlated with MGD, and are also somewhat correlated with each other (Figure 1). Because depth has an erroneous value of zero for almost 25% of its values, and provides similar information to population, we will not use depth as a predictor. Precipitation is not correlated with MGD and will not add explanatory power to linear models, and can also be dropped from the analysis^[Various non-linear models were built that included precipitation, well depth, and geographic coordinates. Figure 8 in Appendix A is an example.].
 
 The response variable (mgd) must be greater than zero, and we will place this constraint on the models by taking the log transformation of mgd. When we exponentiate the predictions post-modeling we are guaranteed a positive value (for any real $a$, $10^a > 0$).
 
@@ -391,7 +391,7 @@ stopCluster(cl)
 proc.time() - ptm # Stop the clock
 ```
 
-```{r fig1_A, ,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Regression trees and gradient boosting models built with population (tree1, gbm1) and with population and precipitation (tree2,gbm2).",fig.height=5, fig.width=6, cache=T}
+```{r fig1_A, ,eval=T,echo=F, warning=F,message=F,fig.align='center', fig.cap="Regression trees and gradient boosting models built with population (tree1, gbm1) and with population and precipitation (tree2, gbm2).",fig.height=5, fig.width=6, cache=T}
 set.seed(5)
 tree2 <- rpart(log.mgd ~ log.pop + precip, data = mod.dat, control=rpart.control(minsplit=100, cp=0))
 
